@@ -1,0 +1,21 @@
+# act_runner configuration of the lab hand (one runner per product that declares `hands: [lab]`, registered to that
+# product's Gitea organisation only, so other products' workflows cannot reach it). Jobs with `runs-on: lab` run in
+# the factory-lab:1 image (QEMU, baked Alpine cloud image, factory-vm-run) with /dev/kvm passed in; unprivileged, no
+# volumes, on the factory-gitea network so actions/checkout reaches Gitea as http://gitea:3000.
+log:
+  level: info
+runner:
+  file: /data/.runner
+  capacity: 1
+  timeout: 1h
+  labels:
+    - "lab:docker://factory-lab:1"
+cache:
+  enabled: false
+container:
+  network: factory-gitea_default
+  privileged: false
+  docker_host: "-"   # never mount the Docker socket into jobs (see infra/core/gitea/runner.yaml)
+  options: --device /dev/kvm
+  valid_volumes: []
+  force_pull: false

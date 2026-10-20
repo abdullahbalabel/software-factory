@@ -1,0 +1,22 @@
+# act_runner configuration (factory-core-1). Jobs run as sibling containers on the VM's Docker, attached to the
+# factory-gitea network so they reach Gitea as http://gitea:3000.
+log:
+  level: info
+runner:
+  file: /data/.runner
+  capacity: 2
+  timeout: 3h
+  labels:
+    - "ubuntu-latest:docker://node:22-bookworm"
+    - "linux:docker://node:22-bookworm"
+cache:
+  enabled: true
+  dir: /data/cache
+container:
+  network: factory-gitea_default
+  privileged: false
+  # "-": the runner finds Docker itself but does NOT mount its socket into job containers (act_runner's default with
+  # an empty value mounts /var/run/docker.sock into every job, i.e. root on the VM for any workflow).
+  docker_host: "-"
+  valid_volumes: []
+  force_pull: false

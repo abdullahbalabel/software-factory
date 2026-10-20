@@ -1,0 +1,14 @@
+<!-- libvirt NAT network for the factory VM only. Separate from the host's other networks.
+     No DHCP and no libvirt DNS: the VM has a static address and public resolvers, so it never needs the host. -->
+<network>
+  <name>factory-net</name>
+  <forward mode='nat'>
+    <nat>
+      <port start='1024' end='65535'/>
+    </nat>
+  </forward>
+  <bridge name='virbr-factory' stp='on' delay='0'/>
+  <mac address='52:54:00:88:00:01'/>
+  <dns enable='no'/>
+  <ip address='10.88.0.1' netmask='255.255.255.0'/>
+</network>

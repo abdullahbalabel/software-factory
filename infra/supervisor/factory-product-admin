@@ -1,0 +1,227 @@
+#!/usr/bin/python3
+"""Root helper for products (docs/specs/supervisor.md "Products from Zulip"). Installed root-owned at
+/usr/local/sbin/factory-product-admin; the supervisor may run it as root through one sudo rule, so every argument is
+validated here and nothing else is reachable.
+
+  sync                 agent users (agent-chat + agent-<product>), the factory's playbook skills in each one's OMP
+                       profile, and the sudo rules; run by install.sh (so by every update.sh)
+  add <name>           title on stdin (one line): writes products/<name>/product.yml in the deployed checkout,
+                       provisions Gitea (organisation, repository with README and the default gates workflow,
+                       protected main, agent account with a write token), creates the Unix user agent-<name>, refreshes
+                       sudo and skills, stores the agent's token in its home. Prints the product as JSON.
+  remove <name>        the reverse: Gitea repository, organisation, agent account and token; Unix user, its
+                       workspaces and home; the product file; sudo. Refuses the default product.
+  hands <name> [hand…] sets `hands` in products/<name>/product.yml (deployed checkout; hands known in config.yml),
+                       then starts or stops lab runners (infra/hands/lab/install.py) when `lab` changed. Prints the
+                       product and the new file as JSON (the supervisor commits the file to the Gitea copy).
+"""
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+import yaml
+
+ROOT = "/opt/factory/software-factory"
+sys.path.insert(0, os.path.join(ROOT, "infra", "supervisor"))
+import provision as pv  # noqa: E402
+
+NAME = re.compile(r"^[a-z][a-z0-9-]{0,18}[a-z0-9]$")
+RESERVED = {"factory", "chat", "admin", "root", "api", "explore", "user", "users", "org", "orgs", "repo", "assets",
+            "factory-reader", "agents", "all", "general", "requests", "digest", "supervisor"}
+EXEC = "/usr/local/sbin/factory-agent-exec"
+HELPER = "/usr/local/sbin/factory-product-admin"
+WS = "/srv/factory/workspaces"
+SKILLS = os.path.join(ROOT, "skills")
+
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(2)
+
+
+def config():
+    with open(os.path.join(ROOT, "supervisor", "config.yml")) as f:
+        return yaml.safe_load(f)
+
+
+def products():
+    out = {}
+    for pf in sorted(glob.glob(os.path.join(ROOT, "products", "*", "product.yml"))):
+        with open(pf) as f:
+            p = yaml.safe_load(f)
+        out[p["name"]] = p
+    return out
+
+
+def run(*argv, **kw):
+    return subprocess.run(argv, check=True, stdin=kw.pop("stdin", subprocess.DEVNULL), **kw)
+
+
+def sync():
+    """Agent users exist with the right groups, and sudo allows exactly them (plus this helper as root)."""
+    run("bash", "-c", "getent group factory-agents >/dev/null || groupadd --system factory-agents")
+    cfg = config()
+    profiles = {cfg["chat"]["agent_user"]: cfg["chat"]["omp_profile"]}
+    profiles.update({p["agent_user"]: p["omp_profile"] for p in products().values()})
+    users = list(profiles)
+    os.makedirs(WS, mode=0o755, exist_ok=True)
+    for u in users:
+        if not re.fullmatch(r"agent-[a-z0-9-]+", u):
+            die(f"bad agent user {u}")
+        if subprocess.run(["id", u], capture_output=True).returncode != 0:
+            run("useradd", "--create-home", "--user-group", "--groups", "factory-agents", "--shell", "/bin/bash", u)
+        groups = subprocess.run(["id", "-nG", u], capture_output=True, text=True).stdout.split()
+        bad = {"sudo", "docker", "adm"} & set(groups)
+        if bad:
+            die(f"{u} must not be in group(s) {', '.join(sorted(bad))}")
+        os.chmod(f"/home/{u}", 0o700)
+        run("install", "-d", "-o", u, "-g", u, "-m", "700", f"{WS}/{u}")
+        install_skills(u, profiles[u])
+    # The prompt files keep prompts out of sudo's log; allowed agent commands are not logged at all (hundreds a day,
+    # nothing secret but nothing useful either). Product administration stays logged.
+    rules = (f"Defaults!{EXEC} !log_allowed\n"
+             f"factory-supervisor ALL=({','.join(users)}) NOPASSWD: {EXEC}\n"
+             f"factory-supervisor ALL=(root) NOPASSWD: {HELPER}\n")
+    tmp = "/etc/sudoers.d/.factory-supervisor.tmp"
+    with open(tmp, "w") as f:
+        f.write(rules)
+    os.chmod(tmp, 0o440)
+    if subprocess.run(["visudo", "-cqf", tmp]).returncode != 0:
+        os.unlink(tmp)
+        die("sudo rules failed to validate")
+    os.replace(tmp, "/etc/sudoers.d/factory-supervisor")
+    return users
+
+
+def install_skills(user, profile):
+    """The factory's general playbooks (skills/<name>/SKILL.md in the checkout) into the user's OMP profile
+    (~/.omp/profiles/<profile>/agent/skills/, OMP's user-level skills directory). Copied AS the agent user, so root
+    never writes into a tree the agent controls; playbooks no longer in the checkout are removed."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", profile):
+        die(f"bad profile {profile}")
+    names = sorted(n for n in os.listdir(SKILLS) if re.fullmatch(r"factory-[a-z0-9-]+", n)
+                   and os.path.isfile(os.path.join(SKILLS, n, "SKILL.md")))
+    dst = f"/home/{user}/.omp/profiles/{profile}/agent/skills"
+    script = ['set -e', 'umask 077', f'mkdir -p "{dst}"',
+              f'for d in "{dst}"/factory-*; do [ -e "$d" ] || continue; case " {" ".join(names)} " in '
+              f'*" $(basename "$d") "*) ;; *) rm -rf -- "$d" ;; esac; done']
+    script += [f'mkdir -p "{dst}/{n}" && cp -f -- "{SKILLS}/{n}/SKILL.md" "{dst}/{n}/SKILL.md"' for n in names]
+    run("runuser", "-u", user, "--", "/bin/bash", "-c", "\n".join(script))
+
+
+def gitea_exists(path):
+    return pv.exists(path)
+
+
+def add(name):
+    if not NAME.fullmatch(name) or "--" in name:
+        die("name: 2-20 characters, lowercase letters, digits and single hyphens, starting with a letter")
+    if name in RESERVED:
+        die(f"name {name} is reserved")
+    if name in products():
+        die(f"product {name} already exists")
+    title = sys.stdin.readline().strip()[:80] or name
+    p = {"name": name, "title": title, "zulip_stream": name,
+         "gitea": {"org": name, "repo": name, "branch": "main", "agent_login": f"{name}-agent"},
+         "agent_user": f"agent-{name}", "omp_profile": name, "hands": [],
+         "gates": [".gitea/workflows/gates.yml"], "release_targets": []}
+    for path in (f"orgs/{name}", f"users/{name}", f"users/{name}-agent"):
+        if gitea_exists(path):
+            die(f"Gitea already has {path.split('/', 1)[1]}; choose another name")
+    if subprocess.run(["id", p["agent_user"]], capture_output=True).returncode == 0:
+        die(f"Unix user {p['agent_user']} already exists")
+    d = os.path.join(ROOT, "products", name)
+    os.makedirs(d, mode=0o755)
+    text = ("# Product registry entry (docs/specs/products.md). Created from Zulip with /product new.\n"
+            + yaml.safe_dump(p, sort_keys=False, allow_unicode=True))
+    with open(os.path.join(d, "product.yml"), "w") as f:
+        f.write(text)
+    os.chmod(os.path.join(d, "product.yml"), 0o644)
+    full = pv.product(p)
+    pv.collaborator(full, "factory-reader", "read")
+    sync()
+    with open(f"{pv.SUP}/gitea_token_{name}") as f:
+        token = f.read()
+    run("runuser", "-u", p["agent_user"], "--", EXEC, "set-token", p["gitea"]["agent_login"], input=token.encode(),
+        stdin=None, stdout=subprocess.DEVNULL)
+    print(json.dumps({"product": p, "file": text, "repo": full}))
+
+
+def remove(name):
+    if not NAME.fullmatch(name):
+        die("bad name")
+    ps = products()
+    if name not in ps:
+        die(f"no product {name}")
+    if name == config()["default_product"]:
+        die(f"{name} is the default product; it cannot be removed from chat")
+    p = ps[name]
+    gi = p["gitea"]
+    for method, path in (("DELETE", f"repos/{gi['org']}/{gi['repo']}"), ("DELETE", f"orgs/{gi['org']}"),
+                         ("DELETE", f"admin/users/{gi['agent_login']}?purge=true")):
+        if gitea_exists(path.split("?")[0].replace("admin/users", "users")):
+            pv.g(method, path)
+    for f in (f"{pv.SUP}/gitea_token_{name}",):
+        if os.path.exists(f):
+            os.unlink(f)
+    u = p["agent_user"]
+    if re.fullmatch(r"agent-[a-z0-9-]+", u) and u != config()["chat"]["agent_user"]:
+        subprocess.run(["pkill", "-KILL", "-u", u], capture_output=True)
+        if subprocess.run(["id", u], capture_output=True).returncode == 0:
+            run("userdel", "--remove", u, stderr=subprocess.DEVNULL)
+        shutil.rmtree(f"{WS}/{u}", ignore_errors=True)
+    shutil.rmtree(os.path.join(ROOT, "products", name), ignore_errors=True)
+    sync()
+    print(json.dumps({"removed": name}))
+
+
+def set_hands(name, hands):
+    if not NAME.fullmatch(name):
+        die("bad name")
+    if name not in products():
+        die(f"no product {name}")
+    known = config().get("hands") or {}
+    bad = [h for h in hands if h not in known]
+    if bad or len(set(hands)) != len(hands):
+        die(f"hands must be distinct and among {', '.join(sorted(known))}")
+    path = os.path.join(ROOT, "products", name, "product.yml")
+    with open(path) as f:
+        old = f.read()
+    p = yaml.safe_load(old)
+    before = list(p.get("hands") or [])
+    p["hands"] = list(hands)
+    head = "".join(ln for ln in old.splitlines(keepends=True)[:5] if ln.startswith("#")) or \
+        "# Product registry entry (docs/specs/products.md).\n"
+    text = head + yaml.safe_dump(p, sort_keys=False, allow_unicode=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+    if ("lab" in before) != ("lab" in hands):
+        run("python3", os.path.join(ROOT, "infra", "hands", "lab", "install.py"), stdout=sys.stderr)
+    print(json.dumps({"product": p, "file": text}))
+
+
+def main():
+    if os.geteuid() != 0:
+        die("run as root")
+    args = sys.argv[1:]
+    if args == ["sync"]:
+        print(" ".join(sync()))
+    elif len(args) == 2 and args[0] == "add":
+        add(args[1])
+    elif len(args) == 2 and args[0] == "remove":
+        remove(args[1])
+    elif len(args) >= 2 and args[0] == "hands":
+        set_hands(args[1], args[2:])
+    else:
+        die("usage: factory-product-admin sync | add <name> (title on stdin) | remove <name> | hands <name> [hand…]")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,37 @@
+# Factory supervisor (docs/specs/supervisor.md). Installed by infra/supervisor/install.sh.
+# A systemd service rather than a Compose container: the agents it starts must run as separate unprivileged Unix
+# users with their own OMP homes (docs/specs/security.md); doing that from a container would need a root process
+# that switches users inside the container plus the OMP install and homes duplicated into images and volumes.
+[Unit]
+Description=Factory supervisor (Zulip <-> Gitea <-> OMP agents)
+Wants=network-online.target factory-omp-broker.service
+After=network-online.target docker.service factory-omp-broker.service
+StartLimitIntervalSec=0
+# Held on a rehearsal restore (the old server is live) and on a fresh install until it is on the tailnet
+# (infra/factory.sh).
+ConditionPathExists=!/var/lib/factory/hold
+ConditionPathExists=!/var/lib/factory/hold-supervisor
+
+[Service]
+Type=simple
+User=factory-supervisor
+Group=factory-supervisor
+WorkingDirectory=/opt/factory/software-factory/supervisor
+Environment=PYTHONPATH=/opt/factory/software-factory/supervisor PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m factory_supervisor --config /opt/factory/software-factory/supervisor/config.yml
+# Secrets: root-only files, handed to this service only (readable as $CREDENTIALS_DIRECTORY/sup_<name>).
+LoadCredential=sup:/srv/factory/secrets/supervisor
+StateDirectory=factory-supervisor
+StateDirectoryMode=0700
+LogsDirectory=factory-supervisor
+LogsDirectoryMode=0750
+StandardInput=null
+# SIGTERM to the supervisor only: it records in-flight steps, stops its agent processes and exits. Agents run in
+# sudo sessions that systemd may not reach, so the next start also stops any leftover (factory-agent-exec stop-agents).
+KillMode=mixed
+TimeoutStopSec=20
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

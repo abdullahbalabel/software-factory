@@ -1,0 +1,30 @@
+# Lab hand runner of one product (project factory-lab-<org>), started by infra/hands/lab/install.py with LAB_ORG and
+# LAB_TOKEN_FILE (the organisation's runner registration token, root 0600 under /srv/factory/secrets).
+services:
+  runner:
+    image: gitea/act_runner:0.6.1
+    restart: unless-stopped
+    environment:
+      GITEA_INSTANCE_URL: http://gitea:3000
+      GITEA_RUNNER_REGISTRATION_TOKEN_FILE: /run/secrets/lab_runner_token
+      GITEA_RUNNER_NAME: lab-${LAB_ORG}
+      CONFIG_FILE: /config/runner.yaml
+      FACTORY_CONFIG_SHA: ${LAB_CONFIG_SHA}   # changes with runner.yaml, so `up -d` recreates the runner
+    secrets: [lab_runner_token]
+    volumes:
+      - runner-data:/data
+      - ./runner.yaml:/config/runner.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [gitea]
+
+secrets:
+  lab_runner_token:
+    file: ${LAB_TOKEN_FILE}
+
+volumes:
+  runner-data:
+
+networks:
+  gitea:
+    name: factory-gitea_default
+    external: true

@@ -1,0 +1,75 @@
+# Factory supervisor configuration (no secrets; those come from systemd credentials, see infra/supervisor).
+# Products are read from ../products/*/product.yml.
+repo_root: ..
+default_product: sandbox
+state_file: /var/lib/factory-supervisor/state.json
+log_dir: /var/log/factory-supervisor
+
+zulip:
+  site: https://factory-core.tailnet.invalid   # set by `factory.sh tailnet` (/etc/factory-supervisor/site.yml)
+  bot_email: supervisor-bot@factory-core.tailnet.invalid
+  factory_stream: factory
+
+gitea:
+  api: http://127.0.0.1:3000              # on the VM (loopback)
+  public: https://factory-core.tailnet.invalid:8443   # links in messages (tailnet; set by `factory.sh tailnet`)
+  factory_repo: factory/software-factory  # Gitea copy of this repository (chat sessions read it)
+  records_repo: factory/factory-records   # decision log and settings overrides
+
+omp:
+  approval_mode: yolo        # fixed: agents run headless inside the agent-user sandbox (docs/specs/security.md)
+  usage_window: 5h           # window `pace_threshold` applies to (omp usage --json, window id)
+  weekly_window: 7d          # window `pace.weekly_threshold` applies to
+
+chat:
+  agent_user: agent-chat     # read-only Gitea access, own OMP home
+  omp_profile: factory
+  gitea_login: factory-reader
+  token_file: /home/agent-chat/.gitea-token
+
+# Defaults of the settings the owner can change from Zulip (/model, /thinking, /settings). His changes are stored
+# as overrides in factory/factory-records (settings/overrides.json) and logged in its decision-log.md.
+defaults:
+  model: anthropic/claude-sonnet-5
+  thinking: low
+  role.smol: null
+  role.slow: null
+  role.plan: null
+  max_time.plan: 15m
+  max_time.build: 40m
+  max_time.chat: 10m
+  concurrency: 1
+  pace_threshold: 0.7          # 5-hour window
+  pace.weekly_threshold: 0.8   # 7-day window
+  digest.time: "08:00"
+  digest.timezone: Asia/Riyadh
+  gates.max_fixes: 2        # red gates: the agent gets the failing log this many times, then the owner is asked
+  gates.timeout: 30m        # no gate result for one push within this time: the owner is asked
+
+# Owner's attachments (files and images in Zulip messages) copied into the task or chat workspace (attachments/).
+attachments:
+  max_mb: 25
+  extensions: [png, jpg, jpeg, gif, webp, svg, pdf, txt, md, csv, tsv, json, yaml, yml, xml, log, html, docx, xlsx, pptx, zip]
+
+# Daily digest (#factory > digest): what it reads for backup status.
+digest:
+  backup_unit: factory-backup.service
+  offsite_status_file: /var/lib/factory-offsite/last-pull   # written by infra/offsite/pull-backup.py over SSH
+
+# Hands (docs/architecture.md#hands): machines that run a product's gates jobs with `runs-on: <label>` and report
+# back through Gitea Actions. No OMP there (D8); agents only push workflow jobs. A product uses a hand when its
+# product.yml lists it under `hands` and a runner with that label is registered to its Gitea organisation.
+# `agents` is what the agent is told about the hand (system prompt).
+hands:
+  windows:
+    label: windows
+    agents: >-
+      the owner's Windows PC (act_runner in host mode, as the low-privilege local user factory-hand; Windows
+      PowerShell 5.1: use `shell: powershell`; git and node on PATH; no Docker, Hyper-V, signing keys or the
+      owner's files; one job at a time)
+  lab:
+    label: lab
+    agents: >-
+      the lab runner (Linux job container factory-lab:1 with /dev/kvm). `factory-vm-run [--timeout S] SCRIPT` boots
+      a throwaway Alpine Linux VM (KVM, 512 MB, user-mode network), runs SCRIPT in it as root, prints its output and
+      exits with its exit code (boot about 40 s); the serial console is left in ./vm-console.log

@@ -1,0 +1,15 @@
+# Product registry entry (docs/specs/products.md). Sample product used to prove the factory end to end.
+name: sandbox
+title: Sandbox (factory test product)
+zulip_stream: sandbox
+gitea:
+  org: sandbox
+  repo: playground
+  branch: main                 # default branch; protected (no direct pushes)
+  agent_login: sandbox-agent   # Gitea account of this product's agents: write access to sandbox/playground only
+agent_user: agent-sandbox      # Unix user the product's OMP sessions run as (no sudo, no docker, no secrets)
+omp_profile: sandbox
+hands: [lab]                   # lab runner lab-sandbox on the factory VM (F4); `windows` once the owner approves the
+                               # Windows hand install (docs/specs/security.md#hands)
+gates: [.gitea/workflows/gates.yml]   # in sandbox/playground: text hygiene + shellcheck (F3)
+release_targets: []

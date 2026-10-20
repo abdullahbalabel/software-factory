@@ -1,0 +1,21 @@
+# Factory signer (D22): signs and publishes the release packages of successful default-branch builds
+# (infra/signer/factory-signer run). Started by factory-signer.timer every 5 minutes; installed by install.sh.
+[Unit]
+Description=Factory signer: sign release packages of successful builds
+Wants=network-online.target
+After=network-online.target docker.service
+# Held on a rehearsal restore (the old server is live and signs) and on a stopped server (infra/factory.sh).
+ConditionPathExists=!/var/lib/factory/hold
+
+[Service]
+Type=oneshot
+User=factory-signer
+Group=factory-signer
+Environment=HOME=/srv/factory/signer PYTHONUNBUFFERED=1
+WorkingDirectory=/srv/factory/signer
+ExecStart=/usr/bin/python3 /usr/local/sbin/factory-signer run
+UMask=0077
+# Unsigned and signed packages are built in a private /tmp that disappears with the run (never in the backup).
+PrivateTmp=yes
+StandardInput=null
+TimeoutStartSec=30min

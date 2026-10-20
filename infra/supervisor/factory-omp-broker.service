@@ -1,0 +1,22 @@
+# OMP auth broker: the one holder of the model login on the factory server. It refreshes the login; agent sessions
+# (agent-* users, any profile) get short-lived access tokens from it over 127.0.0.1 with a bearer token, so no agent
+# user holds the refresh token and several profiles never refresh the same login against each other.
+[Unit]
+Description=OMP auth broker for factory agents
+After=network-online.target
+Wants=network-online.target
+# Held on a rehearsal restore (infra/factory.sh): the old server's broker holds the same login.
+ConditionPathExists=!/var/lib/factory/hold
+
+[Service]
+Type=simple
+User=omp-broker
+Group=omp-broker
+Environment=HOME=/var/lib/omp-broker PATH=/opt/factory-omp/bin:/usr/bin:/bin
+ExecStart=/opt/factory-omp/bin/omp auth-broker serve --bind=127.0.0.1:8765
+StandardInput=null
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

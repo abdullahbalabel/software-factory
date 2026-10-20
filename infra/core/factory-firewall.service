@@ -1,0 +1,15 @@
+# Inbound firewall of the factory server (infra/core/factory-host.nft). Installed by infra/factory.sh.
+[Unit]
+Description=Factory server inbound firewall (nftables table inet factory_host)
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /usr/local/lib/factory/factory-host.nft
+ExecStop=/usr/sbin/nft delete table inet factory_host
+
+[Install]
+WantedBy=multi-user.target

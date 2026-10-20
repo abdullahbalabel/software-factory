@@ -1,0 +1,11 @@
+[Unit]
+Description=Factory nightly backup (Gitea, Zulip, OMP home) into the local restic repository
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+Environment=RESTIC_CACHE_DIR=/var/cache/restic
+ExecStart=/srv/factory/backup/backup.sh
+Nice=10
+IOSchedulingClass=idle

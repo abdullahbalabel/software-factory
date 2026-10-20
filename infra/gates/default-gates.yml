@@ -1,0 +1,46 @@
+# Gates of this product (seeded by the software factory when the product was created).
+# They run on every branch push (not on tags: the factory signer's release tags would run them again on a commit
+# that already passed), on the factory's runner factory-core-1, each job in a container (runner label `linux` =
+# node:22-bookworm). The factory waits for them after each build: a task is done only with green gates, and the
+# owner's `merge` is refused while they are red.
+#
+# PLACEHOLDERS: each job runs the product's own command when the repository has one, and otherwise PASSES WITHOUT
+# CHECKING ANYTHING (it says so in its log). Replace them with the product's real checks as the product grows.
+name: gates
+on:
+  push:
+    branches: ['**']
+
+jobs:
+  lint:
+    runs-on: linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: lint (make lint, or npm run lint)
+        run: |
+          if [ -f Makefile ] && grep -qE '^lint:' Makefile; then
+            make lint
+          elif [ -f package.json ] && grep -q '"lint"' package.json; then
+            npm ci && npm run lint
+          else
+            echo "PLACEHOLDER: no lint command in this repository (make lint / npm run lint); passing without checks"
+          fi
+
+  test:
+    runs-on: linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: test (make check, npm test, or pytest)
+        run: |
+          if [ -f Makefile ] && grep -qE '^check:' Makefile; then
+            make check
+          elif [ -f Makefile ] && grep -qE '^test:' Makefile; then
+            make test
+          elif [ -f package.json ] && grep -q '"test"' package.json; then
+            npm ci && npm test
+          elif ls test_*.py tests/test_*.py >/dev/null 2>&1 || [ -f pytest.ini ] || grep -qs '^\[tool.pytest' pyproject.toml; then
+            python3 -m pytest --version >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3-pytest >/dev/null; }
+            python3 -m pytest -q
+          else
+            echo "PLACEHOLDER: no test command in this repository (make check / npm test / pytest); passing without checks"
+          fi

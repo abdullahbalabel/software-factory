@@ -1,0 +1,23 @@
+#!/usr/sbin/nft -f
+# Inbound firewall of the factory server itself (a VM on a KVM host, or a plain cloud server with a public address).
+# Installed by infra/factory.sh as /usr/local/lib/factory/factory-host.nft and loaded by factory-firewall.service.
+# Own table: Docker's and libvirt's tables are not touched (no `flush ruleset`). Every factory service listens on the
+# loopback only and reaches the owner through `tailscale serve`; from any other interface only SSH (admin), Tailscale's
+# own UDP port, ICMP and DHCP replies come in.
+table inet factory_host
+delete table inet factory_host
+table inet factory_host {
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname "lo" accept
+		ct state established,related accept
+		iifname "tailscale0" accept comment "tailnet: tailscale serve (Zulip 443, Gitea 8443/2222)"
+		iifname "docker0" accept comment "containers to the host"
+		iifname "br-*" accept comment "Compose networks to the host (Zulip trusts the Docker gateway)"
+		tcp dport 22 accept comment "admin SSH (key only)"
+		udp dport 41641 accept comment "Tailscale direct connections"
+		udp dport 68 accept comment "DHCP replies (cloud servers)"
+		meta l4proto { icmp, ipv6-icmp } accept
+		counter drop comment "nothing else from outside"
+	}
+}

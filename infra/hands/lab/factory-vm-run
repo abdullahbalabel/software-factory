@@ -1,0 +1,58 @@
+#!/bin/bash
+# factory-vm-run [--timeout SECONDS] [--memory MB] SCRIPT
+#
+# Lab hand helper (job image factory-lab:1). Boots a throwaway VM from the baked Alpine cloud image (copy-on-write
+# overlay, KVM, user-mode network), runs SCRIPT inside it as root at the end of boot (cloud-init NoCloud), prints the
+# script's output, powers the VM off and exits with the script's exit code (124 on timeout, 125 if the VM gave no
+# result). The full serial console is kept in ./vm-console.log.
+set -euo pipefail
+timeout_s=180
+memory=512
+while [ $# -gt 1 ]; do
+  case "$1" in
+    --timeout) timeout_s=$2; shift 2 ;;
+    --memory) memory=$2; shift 2 ;;
+    *) break ;;
+  esac
+done
+[ $# -eq 1 ] && [ -f "$1" ] || { echo "usage: factory-vm-run [--timeout SECONDS] [--memory MB] SCRIPT" >&2; exit 2; }
+[ -r /dev/kvm ] && [ -w /dev/kvm ] || { echo "factory-vm-run: /dev/kvm not available (job not on the lab hand?)" >&2; exit 2; }
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+qemu-img create -q -f qcow2 -b /opt/lab/alpine.qcow2 -F qcow2 "$work/disk.qcow2" 2G
+b64=$(base64 -w0 "$1")
+cat >"$work/user-data" <<EOF
+#cloud-config
+write_files:
+  - path: /root/factory-test.sh
+    permissions: '0755'
+    encoding: b64
+    content: $b64
+runcmd:
+  - [sh, -c, 'echo "=== factory-vm-run: begin ===" >/dev/ttyS0; sh /root/factory-test.sh >/dev/ttyS0 2>&1; echo "=== factory-vm-run: exit \$? ===" >/dev/ttyS0; poweroff']
+EOF
+printf 'instance-id: factory-%s\nlocal-hostname: lab-vm\n' "$RANDOM" >"$work/meta-data"
+genisoimage -quiet -output "$work/seed.iso" -volid cidata -joliet -rock "$work/user-data" "$work/meta-data"
+
+echo "factory-vm-run: booting $(cat /opt/lab/IMAGE) with KVM, ${memory} MB, timeout ${timeout_s}s"
+start=$(date +%s)
+rc=0
+timeout "$timeout_s" qemu-system-x86_64 -enable-kvm -cpu host -m "$memory" -smp 1 -no-reboot \
+  -display none -serial "file:$PWD/vm-console.log" -monitor none \
+  -drive "file=$work/disk.qcow2,if=virtio" -drive "file=$work/seed.iso,if=virtio,media=cdrom" \
+  -nic user,model=virtio-net-pci || rc=$?
+echo "factory-vm-run: VM stopped after $(( $(date +%s) - start ))s"
+tr -d '\r' <vm-console.log | sed -n '/=== factory-vm-run: begin ===/,/=== factory-vm-run: exit/p'
+if [ "$rc" -eq 124 ]; then
+  echo "factory-vm-run: timeout after ${timeout_s}s; last console lines:" >&2
+  tr -d '\r' <vm-console.log | tail -n 20 >&2
+  exit 124
+fi
+code=$(tr -d '\r' <vm-console.log | sed -n 's/^=== factory-vm-run: exit \([0-9]*\) ===$/\1/p' | tail -n 1)
+if [ -z "$code" ]; then
+  echo "factory-vm-run: the VM gave no result (qemu exit $rc); last console lines:" >&2
+  tr -d '\r' <vm-console.log | tail -n 20 >&2
+  exit 125
+fi
+exit "$code"

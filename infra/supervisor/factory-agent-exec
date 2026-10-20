@@ -1,0 +1,119 @@
+#!/bin/bash
+# The only thing the supervisor may run as an agent user (sudoers: factory-supervisor ALL=(agent-*) NOPASSWD: this).
+# Installed root-owned at /usr/local/sbin/factory-agent-exec. Runs AS the agent user (agent-<product> or agent-chat):
+# no sudo, no docker group, no access to /srv/factory/secrets or the supervisor's state.
+#
+#   omp <args…>                  OMP (shared read-only install in /opt/factory-omp), model login via the local auth
+#                                broker; stdin is the supervisor's RPC pipe or /dev/null, never a terminal
+#   set-token <gitea-login>      store this agent's Gitea token (read from stdin) for git and the Gitea API
+#   workspace <name> <clone-url> clone (or refresh) /srv/factory/workspaces/<user>/<name>; prints its path
+#   rm-workspace <name>          remove a workspace
+#   stop-agents                  stop this user's OMP sessions left over from a previous supervisor process
+#   put-prompt <id>              store a system prompt (stdin) as ~/.factory/prompts/<id>.md (0600, this user only)
+#                                and print its path; OMP reads it at start (--append-system-prompt <path>), so the
+#                                prompt never appears on a command line (ps, sudo's log)
+#   rm-prompt <id>               remove it (the supervisor does so as soon as OMP has started)
+#   put-file <ws> <name> <max>   store an owner's attachment (stdin, at most <max> bytes) as
+#                                <workspace ws>/attachments/<name> (excluded from git); prints its path
+set -euo pipefail
+umask 077
+ME=$(id -un)
+case "$ME" in agent-*) ;; *) echo "factory-agent-exec: must run as an agent-* user, not $ME" >&2; exit 2 ;; esac
+HOME=$(getent passwd "$ME" | cut -d: -f6)
+export HOME USER="$ME" LOGNAME="$ME" SHELL=/bin/bash
+export PATH=/opt/factory-omp/bin:/usr/local/bin:/usr/bin:/bin
+export LANG=C.UTF-8 GIT_TERMINAL_PROMPT=0
+WS_ROOT=/srv/factory/workspaces/$ME
+GITEA=http://127.0.0.1:3000
+name_ok() { [[ "$1" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || { echo "bad name: $1" >&2; exit 2; }; }
+
+cmd=${1:-}
+shift || true
+case "$cmd" in
+  omp)
+    export OMP_AUTH_BROKER_URL=http://127.0.0.1:8765
+    OMP_AUTH_BROKER_TOKEN=$(cat /etc/factory/omp-broker.token)
+    export OMP_AUTH_BROKER_TOKEN
+    cd "$HOME"
+    exec /opt/factory-omp/bin/omp "$@"
+    ;;
+  set-token)
+    login=${1:?gitea login}
+    name_ok "$login"
+    IFS= read -r token
+    [[ "$token" =~ ^[A-Za-z0-9]+$ ]] || { echo "bad token format" >&2; exit 2; }
+    printf '%s\n' "$token" > "$HOME/.gitea-token"
+    printf 'http://%s:%s@127.0.0.1%%3a3000\n' "$login" "$token" > "$HOME/.git-credentials"
+    git config --global credential.helper store
+    git config --global user.name "$login"
+    git config --global user.email "$login@factory.invalid"
+    git config --global init.defaultBranch main
+    git config --global pull.ff only
+    ;;
+  workspace)
+    name=${1:?name} url=${2:?url}
+    name_ok "$name"
+    [[ "$url" =~ ^$GITEA/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\.git$ ]] || { echo "bad url: $url" >&2; exit 2; }
+    ws=$WS_ROOT/$name
+    if [ -d "$ws/.git" ]; then
+      git -C "$ws" fetch -q origin
+      # Refresh only a clean checkout of the default branch (chat's read-only copy); task branches are the agent's.
+      head=$(git -C "$ws" symbolic-ref -q --short HEAD || true)
+      def=$(git -C "$ws" symbolic-ref -q --short refs/remotes/origin/HEAD | sed 's#^origin/##' || true)
+      if [ -n "$def" ] && [ "$head" = "$def" ] && [ -z "$(git -C "$ws" status --porcelain)" ]; then
+        git -C "$ws" merge -q --ff-only "origin/$def" || true
+      fi
+    else
+      git clone -q "$url" "$ws"
+    fi
+    echo "$ws"
+    ;;
+  rm-workspace)
+    name=${1:?name}
+    name_ok "$name"
+    rm -rf -- "${WS_ROOT:?}/$name"
+    ;;
+  stop-agents)
+    rm -rf -- "$HOME/.factory/prompts"   # prompts of sessions a previous supervisor process left behind
+    pat='/opt/factory-omp/bin/omp --mode rpc'
+    if pkill -TERM -u "$ME" -f "$pat"; then
+      for _ in 1 2 3 4 5; do pgrep -u "$ME" -f "$pat" >/dev/null || exit 0; sleep 1; done
+      pkill -KILL -u "$ME" -f "$pat" || true
+    fi
+    ;;
+  put-prompt)
+    id=${1:?id}
+    name_ok "$id"
+    install -d -m 700 "$HOME/.factory" "$HOME/.factory/prompts"
+    f=$HOME/.factory/prompts/$id.md
+    cat > "$f"
+    [ -s "$f" ] || { rm -f "$f"; echo "empty prompt" >&2; exit 2; }
+    echo "$f"
+    ;;
+  rm-prompt)
+    id=${1:?id}
+    name_ok "$id"
+    rm -f -- "$HOME/.factory/prompts/$id.md"
+    ;;
+  put-file)
+    name=${1:?workspace} file=${2:?file name} max=${3:?max bytes}
+    name_ok "$name"
+    [[ "$file" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,150}$ && "$file" != *..* ]] || { echo "bad file name" >&2; exit 2; }
+    [[ "$max" =~ ^[0-9]{1,9}$ ]] || { echo "bad size" >&2; exit 2; }
+    ws=$WS_ROOT/$name
+    [ -d "$ws" ] || { echo "no workspace $name" >&2; exit 2; }
+    install -d -m 700 "$ws/attachments"
+    tmp=$ws/attachments/.$file.part
+    head -c $((max + 1)) > "$tmp"
+    if [ "$(stat -c %s "$tmp")" -gt "$max" ]; then rm -f "$tmp"; echo "file larger than $max bytes" >&2; exit 3; fi
+    mv -f "$tmp" "$ws/attachments/$file"
+    if [ -d "$ws/.git" ] && ! grep -qx '/attachments/' "$ws/.git/info/exclude" 2>/dev/null; then
+      echo '/attachments/' >> "$ws/.git/info/exclude"
+    fi
+    echo "$ws/attachments/$file"
+    ;;
+  *)
+    echo "usage: factory-agent-exec omp|set-token|workspace|rm-workspace|stop-agents|put-prompt|rm-prompt|put-file …" >&2
+    exit 2
+    ;;
+esac

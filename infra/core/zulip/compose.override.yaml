@@ -1,0 +1,41 @@
+# Factory cockpit: docker-zulip 12.3-0 (upstream compose.yaml from github.com/zulip/docker-zulip tag 12.3-0, kept
+# unchanged next to this file as compose.yaml). Project name factory-zulip; lives in /srv/factory/zulip on the VM.
+# Zulip serves plain HTTP on 127.0.0.1:8080 only; TLS and tailnet access come from `tailscale serve` on the VM
+# (certificate for the VM's ts.net name). Secrets: /srv/factory/secrets (infra/core/gen-secrets.sh).
+name: factory-zulip
+
+secrets:
+  zulip__postgres_password:
+    file: /srv/factory/secrets/zulip__postgres_password
+  zulip__memcached_password:
+    file: /srv/factory/secrets/zulip__memcached_password
+  zulip__rabbitmq_password:
+    file: /srv/factory/secrets/zulip__rabbitmq_password
+  zulip__redis_password:
+    file: /srv/factory/secrets/zulip__redis_password
+  zulip__secret_key:
+    file: /srv/factory/secrets/zulip__secret_key
+  zulip__email_password:
+    file: /srv/factory/secrets/zulip__email_password
+
+services:
+  zulip:
+    # Only the web port, only on the VM's loopback. No SMTP (25) and no direct 443.
+    ports: !override
+      - "127.0.0.1:8080:80"
+    environment:
+      # The VM's tailnet name; set ZULIP_EXTERNAL_HOST in .env once the VM has joined the tailnet.
+      SETTING_EXTERNAL_HOST: "${ZULIP_EXTERNAL_HOST:-factory-core.tailnet.invalid}"
+      # The owner's e-mail (ZULIP_ADMINISTRATOR in .env, written by infra/factory.sh install).
+      SETTING_ZULIP_ADMINISTRATOR: "${ZULIP_ADMINISTRATOR:-root@localhost}"
+      # TLS terminates in `tailscale serve` on the VM; it reaches Zulip through the Docker gateway.
+      TRUST_GATEWAY_IP: "True"
+      # Two-factor sign-in (TOTP) available in each user's settings.
+      SETTING_TWO_FACTOR_AUTHENTICATION_ENABLED: "True"
+      # Push notifications through Zulip's service. ZULIP_PUSH_NOTIFICATIONS in .env, written by infra/factory.sh:
+      # False on a fresh install until the owner accepts Zulip's terms (`factory.sh push-register`) and on a
+      # rehearsal restore (it must not push or report usage as the live server); True on the server that holds the
+      # registration (the live one, or the one that took over). Usage statistics go only where push goes.
+      SETTING_ZULIP_SERVICE_PUSH_NOTIFICATIONS: "${ZULIP_PUSH_NOTIFICATIONS:-False}"
+      SETTING_ZULIP_SERVICE_SUBMIT_USAGE_STATISTICS: "${ZULIP_PUSH_NOTIFICATIONS:-False}"
+      SETTING_REQUIRE_E2EE_PUSH_NOTIFICATIONS: "True"

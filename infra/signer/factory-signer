@@ -1,0 +1,539 @@
+#!/usr/bin/python3
+"""Factory signer (D22): signs the release packages of successful default-branch builds outside CI and publishes them
+as Gitea pre-releases. The signing keys live only in /srv/factory/signer (user factory-signer, 0700); they never enter
+Gitea, a repository, an agent's workspace or a model's context. Owner guide: README, "Signed release packages".
+
+Installed root-owned at /usr/local/sbin/factory-signer by infra/signer/install.sh (every update.sh, so every
+`factory.sh install` and `restore`). Products: /srv/factory/signer.yml (root-owned; changed only by `add`).
+
+  run                      (factory-signer; factory-signer.timer every 5 minutes) per product: the newest successful
+                           run of its workflow on its branch (Gitea API, the bot's token); unless already done, fetch
+                           its unsigned artifact (`fetch`, through one sudo rule), sign, verify the certificate
+                           against the key's recorded SHA-256, publish release <kind>-<shortsha> (pre-release) with
+                           <prefix>-<version>-<shortsha>.<ext>, record the run in state.json. A run is never signed
+                           twice: state.json, and an existing release for the commit counts as done.
+  fetch <repo> <artifact> <run-id>
+                           (root, via sudo from `run`) the artifact's file on stdout, read from Gitea's storage. Only
+                           for a configured product and a successful run of its workflow on its branch. Exit 3: that
+                           run has no such artifact. (Gitea 28.1's API serves only v4 artifacts; the CI uploads v3
+                           ones, because v4 uploads fail on this server.)
+  add <org/repo> <artifact> <file> <key> [--new-key [--dn DN] | --import <keystore> <info-file>]
+      [--kind android] [--workflow gates.yml] [--branch main] [--prefix P]
+                           (root; infra/signer/add-product.sh) add or replace a product: key created here or imported
+                           (or an existing key reused), Gitea access for the bot, the config entry.
+  provision                (root; install.sh) folders and owners, the Gitea bot factory-signer and its token, its
+                           access to every configured repository, protected tags <kind>-*.
+  status                   (root) products, keys with their certificate SHA-256, the last runs handled.
+
+Kinds: android (zipalign, apksigner v2+v3; v1 too when the APK's minSdk needs it). Windows (osslsigncode with a bought
+code-signing certificate) is not built: add a `sign_windows` to SIGNERS and allow the kind in `add`.
+"""
+import argparse
+import gzip
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+import yaml
+
+HOME = "/srv/factory/signer"
+KEYS = f"{HOME}/keys"
+STATE = f"{HOME}/state.json"
+TOKEN = f"{HOME}/gitea_token"
+CONFIG = "/srv/factory/signer.yml"
+USER = "factory-signer"
+API = "http://127.0.0.1:3000/api/v1"
+GITEA_DIR = "/srv/factory/gitea"
+ARTIFACTS = "/var/lib/docker/volumes/factory-gitea_gitea-data/_data/gitea/actions_artifacts"
+CHECKOUT = "/opt/factory/software-factory"
+TEAM = "release-signer"
+DEFAULT_DN = "CN=Software Factory, O=Software Factory"
+KINDS = {"android": "apk"}  # kind -> package extension; "windows" (exe, osslsigncode) is not built yet
+
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def die(msg, code=1):
+    print(f"factory-signer: {msg}", file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+def load_config():
+    if not os.path.exists(CONFIG):
+        return []
+    with open(CONFIG) as f:
+        return (yaml.safe_load(f) or {}).get("products") or []
+
+
+def pid(p):
+    return f"{p['repo']}/{p['artifact']}"
+
+
+def read_info(path):
+    """key=value lines (alias, store_password, key_password, sha256); '#' comments."""
+    info = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                info[k.strip()] = v.strip()
+    return info
+
+
+def norm_fp(fp):
+    return fp.replace(":", "").strip().lower()
+
+
+def run_cmd(args, env=None, **kw):
+    return subprocess.run(args, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False, **kw)
+
+
+# -- run (factory-signer) ---------------------------------------------------------------------------------------------
+
+class Gitea:
+    def __init__(self):
+        with open(TOKEN) as f:
+            self.headers = {"Authorization": f"token {f.read().strip()}"}
+        # Gitea builds html_url from the request's host (127.0.0.1); links for the owner use the tailnet address.
+        self.public = API.rsplit("/api/", 1)[0]
+        try:
+            with open(f"{GITEA_DIR}/.env") as f:
+                for line in f:
+                    if line.startswith("GITEA_ROOT_URL="):
+                        self.public = line.split("=", 1)[1].strip().rstrip("/")
+        except FileNotFoundError:
+            pass
+
+    def link(self, path):
+        return f"{self.public}/{path}"
+
+    def call(self, method, path, body=None, data=None, ctype=None, ok404=False):
+        hdrs = dict(self.headers)
+        if body is not None:
+            data, hdrs["Content-Type"] = json.dumps(body).encode(), "application/json"
+        elif ctype:
+            hdrs["Content-Type"] = ctype
+        req = urllib.request.Request(f"{API}/{path}", data=data, headers=hdrs, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                raw = r.read()
+        except urllib.error.HTTPError as e:
+            if ok404 and e.code == 404:
+                return None
+            raise RuntimeError(f"Gitea {method} {path}: HTTP {e.code} {e.read()[:300]!r}") from None
+        return json.loads(raw) if raw else None
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def save_state(state):
+    tmp = f"{STATE}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1, sort_keys=True)
+    os.replace(tmp, STATE)
+
+
+def newest_success(g, p):
+    q = urllib.parse.urlencode({"branch": p["branch"], "status": "success", "limit": 50})
+    runs = g.call("GET", f"repos/{p['repo']}/actions/runs?{q}").get("workflow_runs") or []
+    want = f"{p['workflow']}@refs/heads/{p['branch']}"
+    runs = [r for r in runs if r.get("path") == want and r.get("conclusion") == "success"]
+    return max(runs, key=lambda r: r["id"]) if runs else None
+
+
+def sign_android(p, info, src, work):
+    """zipalign, apksigner (v2+v3; v1 only if minSdk needs it), verify. Returns (signed path, version, verify text)."""
+    aligned, signed = f"{work}/aligned.apk", f"{work}/signed.apk"
+    r = run_cmd(["zipalign", "-f", "-p", "4", src, aligned])
+    if r.returncode:
+        raise RuntimeError(f"zipalign failed: {r.stderr.strip()[-300:]}")
+    env = dict(os.environ, FS_STORE_PASS=info["store_password"], FS_KEY_PASS=info["key_password"])
+    r = run_cmd(["apksigner", "sign", "--ks", f"{KEYS}/{p['key']}.jks", "--ks-key-alias", info["alias"],
+                 "--ks-pass", "env:FS_STORE_PASS", "--key-pass", "env:FS_KEY_PASS",
+                 "--v2-signing-enabled", "true", "--v3-signing-enabled", "true", "--v4-signing-enabled", "false",
+                 "--out", signed, aligned], env=env)
+    del env
+    if r.returncode:
+        raise RuntimeError(f"apksigner sign failed: {r.stderr.strip()[-300:]}")
+    r = run_cmd(["apksigner", "verify", "--verbose", "--print-certs", signed])
+    out = r.stdout
+    digests = re.findall(r"^Signer #\d+ certificate SHA-256 digest: ([0-9a-f]+)$", out, re.MULTILINE)
+    v2v3 = re.search(r"^Verified using v2 scheme \(APK Signature Scheme v2\): true$", out, re.MULTILINE) and \
+        re.search(r"^Verified using v3 scheme \(APK Signature Scheme v3\): true$", out, re.MULTILINE)
+    if r.returncode or not v2v3 or digests != [norm_fp(info["sha256"])]:
+        raise RuntimeError(f"verification failed (exit {r.returncode}, certificates {digests}): {out[-500:]}")
+    if run_cmd(["zipalign", "-c", "-p", "4", signed]).returncode:
+        raise RuntimeError("signed APK is not aligned")
+    r = run_cmd(["aapt", "dump", "badging", signed])
+    m = re.search(r"versionName='([^']*)'", r.stdout)
+    version = re.sub(r"[^A-Za-z0-9._+-]", "_", m.group(1)) if m and m.group(1) else "0"
+    return signed, version, out
+
+
+SIGNERS = {"android": sign_android}
+
+
+def published(g, p, tag, prefix):
+    rel = g.call("GET", f"repos/{p['repo']}/releases/tags/{tag}", ok404=True)
+    if rel and any(a["name"].startswith(prefix) for a in rel.get("assets") or []):
+        return rel
+    return None
+
+
+def upload(g, repo, rel_id, name, path):
+    boundary = uuid.uuid4().hex
+    with open(path, "rb") as f:
+        payload = f.read()
+    body = (f'--{boundary}\r\nContent-Disposition: form-data; name="attachment"; filename="{name}"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n").encode() + payload + f"\r\n--{boundary}--\r\n".encode()
+    q = urllib.parse.urlencode({"name": name})
+    return g.call("POST", f"repos/{repo}/releases/{rel_id}/assets?{q}", data=body,
+                  ctype=f"multipart/form-data; boundary={boundary}")
+
+
+def handle(g, state, p):
+    key = pid(p)
+    done = state.setdefault(key, {})
+    run = newest_success(g, p)
+    if not run:
+        return
+    rid = str(run["id"])
+    if rid in done:
+        return
+    sha, short = run["head_sha"], run["head_sha"][:7]
+    tag = f"{p['kind']}-{short}"
+    run_path = f"{p['repo']}/actions/runs/{run['run_number']}"  # the web page takes the run number, not the id
+    rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "run": run["run_number"], "sha": sha}
+    rel = published(g, p, tag, p["prefix"])
+    if rel:
+        done[rid] = {**rec, "outcome": "already published", "release": g.link(f"{p['repo']}/releases/tag/{tag}")}
+        log(f"{key}: run {run['run_number']} ({short}) already published as {tag}")
+        return
+    with tempfile.TemporaryDirectory(prefix="sign-") as work:
+        src = f"{work}/{p['file']}"
+        with open(src, "wb") as out:
+            r = subprocess.run(["sudo", "-n", "/usr/local/sbin/factory-signer", "fetch", p["repo"], p["artifact"],
+                                rid], stdout=out, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, check=False)
+        if r.returncode == 3:
+            done[rid] = {**rec, "outcome": f"no artifact {p['artifact']}"}
+            log(f"{key}: run {run['run_number']} ({short}) has no artifact {p['artifact']}; skipped")
+            return
+        if r.returncode:
+            raise RuntimeError(f"fetch failed (exit {r.returncode}): {r.stderr.decode(errors='replace')[-300:]}")
+        info = read_info(f"{KEYS}/{p['key']}.txt")
+        fp = norm_fp(info["sha256"])
+        signed, version, verify = SIGNERS[p["kind"]](p, info, src, work)
+        del info
+        asset = f"{p['prefix']}-{version}-{short}.{KINDS[p['kind']]}"
+        rel = g.call("GET", f"repos/{p['repo']}/releases/tags/{tag}", ok404=True) or g.call(
+            "POST", f"repos/{p['repo']}/releases", {
+                "tag_name": tag, "target_commitish": sha, "name": f"{p['prefix']} {version} ({short})",
+                "prerelease": True, "draft": False,
+                "body": (f"Signed by the factory signer from the unsigned artifact `{p['artifact']}` of "
+                         f"[{p['workflow']} run {run['run_number']}]({g.link(run_path)}) on `{p['branch']}`, "
+                         f"commit {sha}.\n\nSigning certificate SHA-256: `{fp}`")})
+        upload(g, p["repo"], rel["id"], asset, signed)
+        done[rid] = {**rec, "outcome": "signed", "release": g.link(f"{p['repo']}/releases/tag/{tag}"), "asset": asset}
+        log(f"{key}: run {run['run_number']} ({short}) signed, certificate {fp}; published {asset} in "
+            f"{done[rid]['release']} (from {g.link(run_path)})")
+        for line in verify.splitlines():
+            if line.startswith(("Verifies", "Verified using", "Signer #1 certificate SHA-256", "Number of signers")):
+                log(f"  {line}")
+
+
+def cmd_run(_):
+    if os.geteuid() == 0:
+        die("run as factory-signer (the service), not as root")
+    products = load_config()
+    if not products:
+        return
+    g, state, failed = Gitea(), load_state(), False
+    for p in products:
+        try:
+            handle(g, state, p)
+        except Exception as e:  # noqa: BLE001  one product's failure must not stop the others; retried next time
+            failed = True
+            log(f"{pid(p)}: ERROR {e}")
+        save_state(state)
+    sys.exit(1 if failed else 0)
+
+
+# -- fetch (root, via sudo) -------------------------------------------------------------------------------------------
+
+SQL = """select a.storage_path, a.content_encoding, a.file_size from action_artifact a
+ join action_run r on r.id = a.run_id join repository p on p.id = r.repo_id
+ where lower(p.owner_name) = lower(:'owner') and p.lower_name = lower(:'repo') and r.id = :'run'::bigint
+   and r.workflow_id = :'wf' and r.ref = :'ref' and r.status = 1
+   and a.artifact_name = :'name' and a.artifact_path = :'file' and a.status = 2
+ order by a.id desc limit 1;
+"""
+
+
+def cmd_fetch(a):
+    if os.geteuid() != 0:
+        die("fetch runs as root")
+    if not a.run_id.isdigit():
+        die("bad run id")
+    p = next((p for p in load_config() if p["repo"] == a.repo and p["artifact"] == a.artifact), None)
+    if not p:
+        die("not a configured product")
+    owner, repo = p["repo"].split("/")
+    var = {"owner": owner, "repo": repo, "run": a.run_id, "wf": p["workflow"], "ref": f"refs/heads/{p['branch']}",
+           "name": p["artifact"], "file": p["file"]}
+    args = ["docker", "compose", "exec", "-T", "gitea-db", "psql", "-U", "gitea", "-d", "gitea", "-At", "-F", "\t",
+            "-v", "ON_ERROR_STOP=1"]
+    for k, v in var.items():
+        args += ["-v", f"{k}={v}"]
+    r = subprocess.run(args, input=SQL, capture_output=True, text=True, cwd=GITEA_DIR, check=False)
+    if r.returncode:
+        die(f"database query failed: {r.stderr.strip()[-300:]}")
+    if not r.stdout.strip():
+        die("no such artifact on that run", 3)
+    storage, enc, size = r.stdout.strip().split("\t")
+    path = os.path.normpath(os.path.join(ARTIFACTS, storage))
+    if not path.startswith(ARTIFACTS + "/") or not os.path.isfile(path):
+        die("artifact file missing from storage")
+    if enc not in ("gzip", ""):
+        die(f"unsupported artifact encoding {enc!r}")
+    n = 0
+    with (gzip.open(path, "rb") if enc == "gzip" else open(path, "rb")) as f:
+        out = sys.stdout.buffer
+        while chunk := f.read(1 << 20):
+            out.write(chunk)
+            n += len(chunk)
+    out.flush()
+    if n != int(size):
+        die(f"artifact size {n} differs from the recorded {size}")
+
+
+# -- add / provision / status (root) --------------------------------------------------------------------------------
+
+def pv():
+    sys.path.insert(0, os.path.join(CHECKOUT, "infra", "supervisor"))
+    import provision
+    return provision
+
+
+def own(path, mode):
+    shutil.chown(path, USER, USER)
+    os.chmod(path, mode)
+
+
+def keytool_fp(ks, alias, store_pw, key_pw=None):
+    env = dict(os.environ, FS_STORE_PASS=store_pw, FS_KEY_PASS=key_pw or store_pw)
+    r = run_cmd(["keytool", "-list", "-v", "-keystore", ks, "-storepass:env", "FS_STORE_PASS", "-alias", alias], env=env)
+    m = re.search(r"SHA256:\s*([0-9A-F:]+)", r.stdout)
+    if r.returncode or not m:
+        die(f"cannot read alias {alias} from {ks} (wrong store password or alias?)")
+    if key_pw is not None:  # the private key itself opens with the key password
+        r = run_cmd(["keytool", "-certreq", "-keystore", ks, "-storepass:env", "FS_STORE_PASS", "-alias", alias,
+                     "-keypass:env", "FS_KEY_PASS", "-file", "/dev/null"], env=env)
+        if r.returncode:
+            die(f"the key password does not open alias {alias}")
+    return m.group(1)
+
+
+def write_info(path, alias, store_pw, key_pw, fp, note):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"# {note}\n# Signed by the factory signer (software-factory infra/signer, D22).\n"
+                f"alias={alias}\nstore_password={store_pw}\nkey_password={key_pw}\nsha256={fp}\n")
+    own(path, 0o600)
+
+
+def new_key(key, dn):
+    ks, pw = f"{KEYS}/{key}.jks", secrets.token_urlsafe(32)
+    env = dict(os.environ, FS_STORE_PASS=pw)
+    r = run_cmd(["keytool", "-genkeypair", "-keystore", ks, "-storetype", "PKCS12", "-storepass:env", "FS_STORE_PASS",
+                 "-alias", key, "-keyalg", "RSA", "-keysize", "4096", "-sigalg", "SHA256withRSA",
+                 "-validity", "10958", "-dname", dn], env=env)
+    if r.returncode:
+        die(f"keytool failed: {r.stderr.strip()[-300:]}")
+    own(ks, 0o600)
+    fp = keytool_fp(ks, key, pw)
+    write_info(f"{KEYS}/{key}.txt", key, pw, pw, fp, f"Key {key}, made on the factory (PKCS12: one password)")
+    return fp
+
+
+def import_key(key, ks_src, info_src):
+    info = read_info(info_src)
+    for k in ("alias", "store_password", "key_password"):
+        if not info.get(k):
+            die(f"{info_src} has no {k}=")
+    fp = keytool_fp(ks_src, info["alias"], info["store_password"], info["key_password"])
+    if info.get("sha256") and norm_fp(info["sha256"]) != norm_fp(fp):
+        die(f"{info_src} records sha256 {info['sha256']}, the keystore has {fp}")
+    shutil.copyfile(ks_src, f"{KEYS}/{key}.jks")
+    own(f"{KEYS}/{key}.jks", 0o600)
+    write_info(f"{KEYS}/{key}.txt", info["alias"], info["store_password"], info["key_password"], fp,
+               f"Key {key}, imported")
+    return fp
+
+
+def dirs():
+    os.makedirs(KEYS, exist_ok=True)
+    for root, ds, fs in os.walk(HOME):  # restore: the files come back with the old server's numeric owner
+        for d in ds:
+            own(os.path.join(root, d), 0o700)
+        for f in fs:
+            own(os.path.join(root, f), 0o600)
+    own(HOME, 0o700)
+    if not os.path.exists(CONFIG):
+        save_config([])
+
+
+def save_config(products):
+    tmp = f"{CONFIG}.tmp"
+    with open(tmp, "w") as f:
+        f.write("# Products the factory signs (infra/signer/factory-signer). Change with infra/signer/add-product.sh.\n")
+        yaml.safe_dump({"products": products}, f, sort_keys=False)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, CONFIG)
+
+
+def gitea_access(v, p):
+    """The bot may read the repository's code and Actions runs and write releases, nothing else (team per
+    organisation); only it may create or delete tags <kind>-* (so a product agent's write token cannot publish or
+    remove a release under that name)."""
+    org, _ = p["repo"].split("/")
+    team = next((t for t in v.g("GET", f"orgs/{org}/teams") if t["name"] == TEAM), None)
+    units = {"repo.code": "read", "repo.actions": "read", "repo.releases": "write"}
+    if not team:
+        team = v.g("POST", f"orgs/{org}/teams", {
+            "name": TEAM, "description": "Factory signer: reads Actions runs, publishes signed release packages",
+            "permission": "read", "includes_all_repositories": False, "can_create_org_repo": False,
+            "units_map": units})
+        log(f"team {org}/{TEAM}")
+    v.g("PUT", f"teams/{team['id']}/members/{USER}")
+    v.g("PUT", f"teams/{team['id']}/repos/{p['repo']}")
+    pattern = f"{p['kind']}-*"
+    if not any(t["name_pattern"] == pattern for t in v.g("GET", f"repos/{p['repo']}/tag_protections") or []):
+        v.g("POST", f"repos/{p['repo']}/tag_protections", {"name_pattern": pattern, "whitelist_usernames": [USER]})
+        log(f"protected tags {p['repo']}:{pattern} (only {USER})")
+
+
+def cmd_provision(_):
+    if os.geteuid() != 0:
+        die("provision runs as root")
+    dirs()
+    v = pv()
+    v.user(USER, "Factory signer (reads Actions runs, publishes signed releases)")
+    if not os.path.exists(TOKEN):
+        v.token(USER, "write:repository", TOKEN)
+    own(TOKEN, 0o600)
+    for p in load_config():
+        gitea_access(v, p)
+
+
+def cmd_add(a):
+    if os.geteuid() != 0:
+        die("add runs as root (sudo)")
+    if not REPO_RE.match(a.repo) or not NAME_RE.match(a.artifact) or not NAME_RE.match(a.file):
+        die("repository must be <org>/<repo>; artifact and file names: letters, digits, . _ -")
+    if not KEY_RE.match(a.key):
+        die("key: lowercase letters, digits, _ -")
+    if a.kind == "windows":
+        die("Windows signing is not built yet: it needs osslsigncode and a bought code-signing certificate "
+            "(README, 'Signed release packages')")
+    if a.kind not in KINDS:
+        die(f"unknown kind {a.kind}; built: {', '.join(KINDS)}")
+    prefix = a.prefix or a.file.split("-")[0].split(".")[0]
+    if not NAME_RE.match(prefix):
+        die("bad --prefix")
+    cmd_provision(None)
+    v = pv()
+    v.g("GET", f"repos/{a.repo}")  # the repository must exist
+    ks, info = f"{KEYS}/{a.key}.jks", f"{KEYS}/{a.key}.txt"
+    if a.new_key or a.import_key:
+        if os.path.exists(ks):
+            die(f"key {a.key} exists already; reuse it (no --new-key/--import) or choose another name")
+        fp = new_key(a.key, a.dn) if a.new_key else import_key(a.key, *a.import_key)
+        log(f"key {a.key}: {'created' if a.new_key else 'imported'}, certificate SHA-256 {fp}")
+    elif not (os.path.exists(ks) and os.path.exists(info)):
+        die(f"no key {a.key} here: use --new-key or --import <keystore> <info-file>")
+    else:
+        fp = read_info(info)["sha256"]
+        log(f"key {a.key}: existing, certificate SHA-256 {fp}")
+    entry = {"repo": a.repo, "kind": a.kind, "workflow": a.workflow, "branch": a.branch, "artifact": a.artifact,
+             "file": a.file, "key": a.key, "prefix": prefix}
+    products = [p for p in load_config() if pid(p) != pid(entry)] + [entry]
+    gitea_access(v, entry)
+    save_config(products)
+    log(f"product {pid(entry)}: signed from the next successful {a.workflow} run on {a.branch}")
+    log(f"CI contract: upload the unsigned release package as artifact '{a.artifact}' holding the file '{a.file}' "
+        f"(actions/upload-artifact@v3)")
+    log(f"releases: tag {a.kind}-<shortsha> (pre-release), file {prefix}-<version>-<shortsha>.{KINDS[a.kind]}")
+    if a.new_key:
+        log(f"copy the key to the owner's vault now: {ks} and {info} (also in the nightly backup)")
+
+
+def cmd_status(_):
+    if os.geteuid() != 0:
+        die("status runs as root")
+    state = load_state() if os.path.exists(STATE) else {}
+    products = load_config()
+    if not products:
+        log("no products (add one with infra/signer/add-product.sh)")
+    for p in products:
+        info = f"{KEYS}/{p['key']}.txt"
+        fp = read_info(info).get("sha256", "?") if os.path.exists(info) else "MISSING"
+        log(f"{pid(p)}: {p['kind']}, {p['workflow']} on {p['branch']}, key {p['key']} (SHA-256 {fp})")
+        for rid, rec in sorted(state.get(pid(p), {}).items(), key=lambda kv: int(kv[0]))[-5:]:
+            log(f"  run {rec.get('run')} ({rec.get('sha', '')[:7]}) {rec['at']}: {rec['outcome']} "
+                f"{rec.get('release', '')}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="factory-signer")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("run").set_defaults(fn=cmd_run)
+    f = sub.add_parser("fetch")
+    f.add_argument("repo")
+    f.add_argument("artifact")
+    f.add_argument("run_id")
+    f.set_defaults(fn=cmd_fetch)
+    d = sub.add_parser("add")
+    d.add_argument("repo")
+    d.add_argument("artifact")
+    d.add_argument("file")
+    d.add_argument("key")
+    k = d.add_mutually_exclusive_group()
+    k.add_argument("--new-key", action="store_true")
+    k.add_argument("--import", dest="import_key", nargs=2, metavar=("KEYSTORE", "INFO_FILE"))
+    d.add_argument("--dn", default=DEFAULT_DN)
+    d.add_argument("--kind", default="android")
+    d.add_argument("--workflow", default="gates.yml")
+    d.add_argument("--branch", default="main")
+    d.add_argument("--prefix")
+    d.set_defaults(fn=cmd_add)
+    sub.add_parser("provision").set_defaults(fn=cmd_provision)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
